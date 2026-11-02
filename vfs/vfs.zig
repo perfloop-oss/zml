@@ -487,7 +487,7 @@ test "HTTP positional reads from full responses" {
     const process_io = std.testing.io;
     const Serve = struct {
         fn run(inner: std.Io, server: *std.Io.net.Server) !void {
-            for (0..4) |_| {
+            while (true) {
                 const stream = try server.accept(inner);
                 defer stream.close(inner);
                 var read_buffer: [1024]u8 = undefined;
@@ -497,7 +497,18 @@ test "HTTP positional reads from full responses" {
                 var http: std.http.Server = .init(&reader.interface, &writer.interface);
                 var request = try http.receiveHead();
                 // Ignore Range, as servers without range support do.
-                try request.respond("01234567", .{ .keep_alive = false });
+                if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/broken")) {
+                    try writer.interface.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\n");
+                    try writer.interface.flush();
+                    continue;
+                }
+                const body = if (request.head.method == .HEAD)
+                    "01234567"
+                else if (std.mem.eql(u8, request.head.target, "/short"))
+                    "01"
+                else
+                    "01234567";
+                try request.respond(body, .{ .keep_alive = false });
             }
         }
     };
@@ -532,5 +543,21 @@ test "HTTP positional reads from full responses" {
     n = try file.readStreaming(http_io, &.{&buffer});
     try std.testing.expectEqual(4, n);
     try std.testing.expectEqualStrings("3456", buffer[0..n]);
-    try serving.await(process_io);
+
+    const short_path = try std.fmt.bufPrint(&path_buffer, "127.0.0.1:{d}/short", .{server.socket.address.getPort()});
+    const short_file = try std.Io.Dir.cwd().openFile(http_io, short_path, .{});
+    defer short_file.close(http_io);
+    // The GET body ends before the size cached from HEAD.
+    try std.testing.expectEqual(0, try short_file.readPositional(http_io, &.{&buffer}, 3));
+    try std.testing.expectEqual(1, try short_file.readPositional(http_io, &.{&buffer}, 1));
+    try std.testing.expectEqual('1', buffer[0]);
+    try http_io.vtable.fileSeekTo(http_io.userdata, short_file, 3);
+    try std.testing.expectError(error.EndOfStream, short_file.readStreaming(http_io, &.{&buffer}));
+
+    const broken_path = try std.fmt.bufPrint(&path_buffer, "127.0.0.1:{d}/broken", .{server.socket.address.getPort()});
+    const broken_file = try std.Io.Dir.cwd().openFile(http_io, broken_path, .{});
+    defer broken_file.close(http_io);
+    try std.testing.expectEqual(0, try broken_file.readPositional(http_io, &.{buffer[0..0]}, 1));
+
+    serving.cancel(process_io) catch |err| if (err != error.Canceled) return err;
 }
